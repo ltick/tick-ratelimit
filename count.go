@@ -8,10 +8,11 @@
 package ratelimit
 
 import (
+	"log"
+	"strconv"
 	"sync"
 	"time"
-    "strconv"
-	"log"
+	"fmt"
 )
 
 // Bucket represents a token bucket that fills at a predetermined rate.
@@ -28,13 +29,14 @@ type Counter struct {
 	// It will be negative when there are consumers
 	// waiting for tokens.
 	avail int64
-	task  []*CounterTask
+	tasks  []*CounterTask
 }
 
 type CounterTask struct {
-	count   int64
-	endTime time.Time
-	result  chan bool
+	information string
+	amount       int64
+	deadline     time.Time
+	result      chan bool
 }
 
 // NewCounter returns a new token bucket that fills at the
@@ -49,16 +51,16 @@ func NewCounter(retryInterval time.Duration, capacity int64) *Counter {
 		startTime: time.Now(),
 		capacity:  capacity,
 		avail:     capacity,
-		task:      make([]*CounterTask, 0, 1),
+		tasks:      make([]*CounterTask, 0, 1),
 	}
 	observer := func() {
 		ticker := time.NewTicker(retryInterval)
 		for {
 			select {
 			case <-ticker.C:
-                c.mu.Lock()
+				c.mu.Lock()
 				c.adjust()
-                c.mu.Unlock()
+				c.mu.Unlock()
 			}
 		}
 	}
@@ -67,14 +69,14 @@ func NewCounter(retryInterval time.Duration, capacity int64) *Counter {
 	return c
 }
 
-// Take takes count tokens from the bucket without blocking. It returns
+// Take takes amount tokens from the bucket without blocking. It returns
 // the time that the caller should wait until the tokens are actually
 // available.
 //
 // Note that if the request is irrevocable - there is no way to return
 // tokens to the bucket once this method commits us to taking them.
-func (c *Counter) Take(count int64) bool {
-	return c.take(count, infinityDuration)
+func (c *Counter) Take(information string, amount int64) bool {
+	return c.take(information, amount, infinityDuration)
 }
 
 // TakeMaxDuration is like Take, except that
@@ -86,8 +88,8 @@ func (c *Counter) Take(count int64) bool {
 // otherwise it returns the time that the caller should
 // wait until the tokens are actually available, and reports
 // true.
-func (c *Counter) TakeMaxDuration(count int64, maxWait time.Duration) bool {
-	return c.take(count, maxWait)
+func (c *Counter) TakeMaxDuration(information string, amount int64, maxWait time.Duration) bool {
+	return c.take(information, amount, maxWait)
 }
 
 // Available returns the number of available tokens. It will be negative
@@ -100,6 +102,11 @@ func (c *Counter) Available() int64 {
 	return c.available()
 }
 
+// output all tasks information
+func (c *Counter) Tasks() ([]*CounterTask) {
+	return c.tasks
+}
+
 // available is the internal version of available - it takes the current time as
 // an argument to enable easy testing.
 func (c *Counter) available() int64 {
@@ -109,14 +116,14 @@ func (c *Counter) available() int64 {
 	return c.avail
 }
 
-func (c *Counter) BringAvailable(count int64) bool {
+func (c *Counter) BringAvailable(amount int64) bool {
 	c.mu.Lock()
-	c.avail += count
+	c.avail += amount
 	if c.avail > c.capacity {
 		c.avail = c.capacity
 	}
 	c.adjust()
-    c.mu.Unlock()
+	c.mu.Unlock()
 
 	return true
 }
@@ -128,26 +135,27 @@ func (c *Counter) Capacity() int64 {
 
 // take is the internal version of Take - it takes the current time as
 // an argument to enable easy testing.
-func (c *Counter) take(count int64, maxWait time.Duration) (ok bool) {
-	if count <= 0 {
+func (c *Counter) take(information string, amount int64, maxWait time.Duration) (ok bool) {
+	if amount <= 0 {
 		return true
 	}
-	if count > c.capacity {
+	if amount > c.capacity {
 		return false
 	}
 	c.mu.Lock()
-	avail := c.avail - count
+	avail := c.avail - amount
 	if avail >= 0 {
 		c.avail = avail
-        c.mu.Unlock()
+		c.mu.Unlock()
 		return true
 	}
 	task := &CounterTask{
-		count:   count,
-		endTime: time.Now().Add(maxWait),
+		information: information,
+		amount:   amount,
+		deadline: time.Now().Add(maxWait),
 		result:  make(chan bool),
 	}
-	c.task = append(c.task, task)
+	c.tasks = append(c.tasks, task)
 	c.mu.Unlock()
 	select {
 	case ok = <-task.result:
@@ -158,15 +166,15 @@ func (c *Counter) take(count int64, maxWait time.Duration) (ok bool) {
 
 // adjust adjusts timeout task based on the current time.
 func (c *Counter) adjust() {
-    tmpTask := make([]*CounterTask, 0, 1)
-	for _, task := range c.task {
+	tmpTask := make([]*CounterTask, 0, 1)
+	for _, task := range c.tasks {
 		if task != nil {
-			if time.Now().After(task.endTime) {
+			if time.Now().After(task.deadline) {
 				task.result <- false
 				continue
 			} else {
-				if c.avail >= task.count {
-					c.avail = c.avail - task.count
+				if c.avail >= task.amount {
+					c.avail = c.avail - task.amount
 					task.result <- true
 					continue
 				}
@@ -174,9 +182,13 @@ func (c *Counter) adjust() {
 			tmpTask = append(tmpTask, task)
 		}
 	}
-	c.task = tmpTask
+	c.tasks = tmpTask
 	if len(tmpTask) > 0 {
 		log.Println("task wait queue: " + strconv.Itoa(len(tmpTask)))
 	}
 	return
+}
+
+func (t *CounterTask) String() string {
+	return fmt.Sprintf("info:'%s' amount:'%d' deadline:'%s'", t.information, t.amount, t.deadline.String())
 }
